@@ -1,6 +1,6 @@
 # composite_shape_augmentation
-# Code implementation for : [Data Augmentation-aided fatigue delamination shape prognostics in composites]
 
+# Code implementation for : [Data Augmentation-aided fatigue delamination shape prognostics in composites]
 
 # Installation
 ### Requirements
