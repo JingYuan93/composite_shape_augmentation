@@ -1,205 +1,406 @@
 #!/usr/bin/env python3
-"""
-Command-line tool for Bayesian time-series step prediction with custom cross-validation cases.
-"""
-import argparse
 import os
-import pickle
+import math
+import argparse
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
-import itertools
+from torch.utils.data import DataLoader, TensorDataset
 
+def get_timestep_embedding(timesteps, dim):
+    half = dim // 2
+    exponents = -math.log(10000) * torch.arange(half, device=timesteps.device) / (half - 1)
+    freqs = torch.exp(exponents)
+    args_ = timesteps[:, None].float() * freqs[None]
+    emb = torch.cat([torch.sin(args_), torch.cos(args_)], dim=-1)
+    if dim % 2:
+        emb = F.pad(emb, (0, 1))
+    return emb
 
-class TimeSeriesDataset(Dataset):
-    """Dataset wrapping sliding-window sequences for next-step prediction."""
-    def __init__(self, sequences: torch.Tensor):
-        self.sequences = sequences
-
-    def __len__(self):
-        return len(self.sequences) - 1
-
-    def __getitem__(self, idx):
-        return self.sequences[idx], self.sequences[idx + 1]
-
-
-# ----- Utility functions -----
-
-def normalize_2d_array(arr: np.ndarray):
-    col_max = arr.max(axis=0)
-    col_min = arr.min(axis=0)
-    normalized = (arr - col_min) / (col_max - col_min)
-    return normalized, col_min, col_max
-
-
-def read_normalize_and_split_csv(csv_file: str, split_size: int, num_splits: int, nrows: int):
-    df = pd.read_csv(csv_file, header=None, nrows=nrows)
-    # Insert delta in last column
-    delta = [0, 0.5, 1, 2.5, 5, 7.5, 10, 17.5, 50, 100]
-    if len(df) % len(delta) != 0:
-        raise ValueError("CSV row count must be multiple of delta length.")
-    rep = len(df) // len(delta)
-    df.iloc[:, -1] = np.tile(delta, rep)
-    # Split into equal parts
-    splits = [df.iloc[i * split_size:(i + 1) * split_size].values for i in range(num_splits)]
-    return splits
-
-
-def sliding_windows(data: np.ndarray, window: int, step: int) -> np.ndarray:
-    n_samples = (len(data) - window) // step + 1
-    return np.stack([data[i * step : i * step + window] for i in range(n_samples)], axis=0)
-
-
-# ----- Model definitions -----
-
-class BayesianLinear(nn.Module):
-    def __init__(self, in_features: int, out_features: int):
+class ResBlock1D(nn.Module):
+    def __init__(self, c):
         super().__init__()
-        self.weight_mu = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
-        self.weight_sigma = nn.Parameter(torch.randn(out_features, in_features) * 0.1)
-        self.bias_mu = nn.Parameter(torch.randn(out_features) * 0.1)
-        self.bias_sigma = nn.Parameter(torch.randn(out_features) * 0.1)
+        self.c1 = nn.Conv1d(c, c, 3, padding=1)
+        self.c2 = nn.Conv1d(c, c, 3, padding=1)
+        self.g1 = nn.GroupNorm(1, c)
+        self.g2 = nn.GroupNorm(1, c)
+    def forward(self, x):
+        h = F.relu(self.g1(self.c1(x)))
+        h = self.g2(self.c2(h))
+        return F.relu(h + x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.weight_mu + self.weight_sigma * torch.randn_like(self.weight_sigma)
-        b = self.bias_mu + self.bias_sigma * torch.randn_like(self.bias_sigma)
-        return F.linear(x, w, b)
-
-
-class BayesianNetwork(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, dropout_rate: float = 0.1):
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, c, heads=4):
         super().__init__()
-        self.layer1 = BayesianLinear(input_dim, hidden_dim)
-        self.dropout = nn.Dropout(p=dropout_rate)
-        self.layer2 = BayesianLinear(hidden_dim, output_dim)
+        self.n = nn.LayerNorm(c)
+        self.a = nn.MultiheadAttention(c, heads, batch_first=True)
+    def forward(self, x):
+        h = self.n(x)
+        y, _ = self.a(h, h, h)
+        return x + y
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.layer1(x))
-        x = self.dropout(x)
-        return self.layer2(x)
+class DiffUNet(nn.Module):
+    def __init__(self, in_dim, hid_dim, seq_len):
+        super().__init__()
+        self.tm = nn.Sequential(nn.Linear(hid_dim, hid_dim), nn.ReLU(), nn.Linear(hid_dim, hid_dim))
+        self.cm = nn.Sequential(nn.Linear(in_dim * seq_len, hid_dim), nn.ReLU(), nn.Linear(hid_dim, hid_dim))
+        self.ip = nn.Conv1d(in_dim, hid_dim, 1)
+        self.gi = nn.GroupNorm(1, hid_dim)
+        self.rb = nn.ModuleList([ResBlock1D(hid_dim) for _ in range(4)])
+        self.ab = nn.ModuleList([SelfAttentionBlock(hid_dim) for _ in range(2)])
+        self.go = nn.GroupNorm(1, hid_dim)
+        self.op = nn.Conv1d(hid_dim, in_dim, 1)
+    def forward(self, x, t, cond=None):
+        B, L, C = x.shape
+        temb = get_timestep_embedding(t, args.hid_dim)
+        temb = self.tm(temb)
+        if cond is None:
+            cemb = torch.zeros_like(temb)
+        else:
+            flat = cond.view(B, -1)
+            cemb = self.cm(flat)
+        emb = (temb + cemb).unsqueeze(-1)
+        h = x.permute(0, 2, 1)
+        h = self.gi(self.ip(h))
+        h = h + emb
+        for rb in self.rb:
+            h = rb(h)
+        h2 = h.permute(0, 2, 1)
+        for ab in self.ab:
+            h2 = ab(h2)
+        h3 = h2.permute(0, 2, 1)
+        h3 = self.go(h3)
+        out = self.op(h3)
+        return out.permute(0, 2, 1)
 
+def save_generated(gen, case, model_name):
+    os.makedirs(args.out_dir, exist_ok=True)
+    fname = f"{case}_{model_name}.csv"
+    rows = []
+    for seq in gen:
+        arr = seq.detach().cpu().numpy() * 19.0 + 6.0
+        rows.append(arr.reshape(-1, args.feat_dim))
+    pd.DataFrame(np.vstack(rows)).to_csv(os.path.join(args.out_dir, fname), header=False, index=False)
 
-# ----- Training and prediction -----
-
-def train_model(model: nn.Module, loader: DataLoader, criterion: nn.Module,
-                optimizer: torch.optim.Optimizer, epochs: int):
-    model.train()
-    for _ in range(epochs):
-        for seq in loader:
-            x = seq[:, 0, :].float()
-            y = seq[:, 1, :].float()
-            optimizer.zero_grad()
-            pred = model(x)
-            loss = criterion(pred, y)
-            loss.backward()
-            optimizer.step()
-
-
-def generate_predictions(model: nn.Module, val_sequence: np.ndarray,
-                         window_size: int, step_size: int, n_samples: int) -> np.ndarray:
-    # Normalize and prepare DataLoader
-    val_norm, MIN, MAX = normalize_2d_array(val_sequence)
-    # Autoregressive eval_steps = len(val_norm)-1
-    eval_steps = len(val_norm) - 1
-    loader = DataLoader(TimeSeriesDataset(torch.tensor(val_norm)), batch_size=1)
-
-    model.eval()
-    preds = []
-    # Denorm tensors
-    min_t = torch.tensor(MIN, dtype=torch.float32).unsqueeze(0)
-    max_t = torch.tensor(MAX, dtype=torch.float32).unsqueeze(0)
-
+def train_gan(data, case):
+    class G(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l = nn.LSTM(args.noise_dim, args.hid_dim, 3, batch_first=True)
+            self.o = nn.Linear(args.hid_dim, args.feat_dim)
+        def forward(self, z):
+            h, _ = self.l(z)
+            return torch.sigmoid(self.o(h))
+    class D(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l = nn.LSTM(args.feat_dim, args.hid_dim, 3, batch_first=True)
+            self.o = nn.Linear(args.hid_dim, 1)
+        def forward(self, x):
+            h, _ = self.l(x)
+            return torch.sigmoid(self.o(h[:, -1]))
+    Gm = G().to(device)
+    Dm = D().to(device)
+    oG = torch.optim.Adam(Gm.parameters(), lr=5e-4)
+    oD = torch.optim.Adam(Dm.parameters(), lr=5e-4)
+    bce = nn.BCELoss()
+    loader = DataLoader(TensorDataset(data), batch_size=16, shuffle=True)
+    for _ in range(200):
+        for real, in loader:
+            bs = real.size(0)
+            for __ in range(20):
+                z = torch.randn(bs, args.seq_len, args.noise_dim, device=device)
+                fake = Gm(z)
+                adv = bce(Dm(fake), torch.ones(bs,1,device=device))
+                dif = fake[:,1:,:] - fake[:,:-1,:]
+                lm = torch.mean(F.relu(-dif)**2)
+                dif2 = dif[:,1:,:] - dif[:,:-1,:]
+                lc = torch.mean(F.relu(-dif2)**2)
+                l = adv + args.lambda_mono*lm + args.lambda_curv*lc
+                oG.zero_grad(); l.backward(); oG.step()
+            with torch.no_grad():
+                fake = Gm(torch.randn(bs, args.seq_len, args.noise_dim, device=device))
+            dr = Dm(real); df = Dm(fake)
+            ld = bce(dr, torch.ones_like(dr)) + bce(df, torch.zeros_like(df))
+            oD.zero_grad(); ld.backward(); oD.step()
+    Gm.eval()
     with torch.no_grad():
-        prev = None
-        for i, (seq, next_seq) in enumerate(loader):
-            if i >= eval_steps:
-                break
-            x = seq.float() if i == 0 else prev
-            # Monte Carlo sampling
-            samples = torch.stack([model(x) for _ in range(n_samples)])
-            mean_pred = samples.mean(0)
-            # Denormalize
-            denorm = mean_pred * (max_t - min_t) + min_t
-            preds.append(denorm.squeeze(0).numpy())
-            prev = mean_pred
-    return np.array(preds)
+        z = torch.randn(args.num_samples, args.seq_len, args.noise_dim, device=device)
+        gen = Gm(z).clamp(0,1)
+        gen, _ = torch.cummax(gen, dim=1)
+    save_generated(gen, case, "GAN")
 
+def train_ae(data, case):
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.e = nn.LSTM(args.feat_dim, args.hid_dim, 3, batch_first=True)
+            self.d = nn.LSTM(args.hid_dim, args.hid_dim, 3, batch_first=True)
+            self.o = nn.Linear(args.hid_dim, args.feat_dim)
+        def forward(self, x):
+            _, (h, _) = self.e(x)
+            rep = h[-1].unsqueeze(1).repeat(1, args.seq_len, 1)
+            y, _ = self.d(rep)
+            return torch.sigmoid(self.o(y))
+    model = M().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=5e-4)
+    mse = nn.MSELoss()
+    loader = DataLoader(TensorDataset(data), batch_size=8, shuffle=True)
+    for _ in range(200):
+        for x, in loader:
+            xh = model(x)
+            lrec = mse(xh, x)
+            dif = xh[:,1:,:] - xh[:,:-1,:]
+            lm = torch.mean(F.relu(-dif)**2)
+            dif2 = dif[:,1:,:] - dif[:,:-1,:]
+            lc = torch.mean(F.relu(-dif2)**2)
+            loss = lrec + args.lambda_mono*lm + args.lambda_curv*lc
+            opt.zero_grad(); loss.backward(); opt.step()
+    model.eval()
+    codes = []
+    with torch.no_grad():
+        for i in range(data.size(0)):
+            _, (h, _) = model.e(data[i:i+1])
+            codes.append(h[-1].squeeze(0))
+    codes = torch.stack(codes)
+    gens = []
+    for _ in range(args.num_samples):
+        i, j = np.random.choice(len(codes), 2, replace=False)
+        a = np.random.rand()
+        z = a*codes[i] + (1-a)*codes[j] + 0.02*torch.randn_like(codes[0])
+        rep = z.unsqueeze(0).unsqueeze(1).repeat(1, args.seq_len, 1)
+        y, _ = model.d(rep)
+        y = torch.sigmoid(model.o(y))
+        y, _ = torch.cummax(y, dim=1)
+        gens.append(y.squeeze(0))
+    gen = torch.stack(gens)
+    save_generated(gen, case, "AE")
 
-def cross_validate(args):
-    splits = read_normalize_and_split_csv(
-        args.csv_file, args.split_size, args.num_splits, args.nrows)
-    # Determine validation indices per case
-    case_map = {
-        'case1': [2, 3],
-        'case2': [0, 3],
-        'case3': [1, 3]
-    }
-    val_indices = case_map[args.case]
-    train_indices = [i for i in range(args.num_splits) if i not in val_indices]
+def train_vae(data, case):
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.e = nn.LSTM(args.feat_dim, args.hid_dim, 3, batch_first=True)
+            self.f1 = nn.Linear(args.hid_dim, args.z_dim)
+            self.f2 = nn.Linear(args.hid_dim, args.z_dim)
+            self.di = nn.Linear(args.z_dim, args.hid_dim)
+            self.d = nn.LSTM(args.hid_dim, args.hid_dim, 3, batch_first=True)
+            self.o = nn.Linear(args.hid_dim, args.feat_dim)
+        def encode(self, x):
+            _, (h, _) = self.e(x)
+            h = h[-1]
+            return self.f1(h), self.f2(h)
+        def reparam(self, mu, lv):
+            std = torch.exp(0.5*lv)
+            eps = torch.randn_like(std)
+            return mu + eps*std
+        def decode(self, z):
+            h0 = self.di(z).unsqueeze(0)
+            rep = h0.repeat(args.seq_len,1,1).permute(1,0,2)
+            y, _ = self.d(rep)
+            return torch.sigmoid(self.o(y))
+        def forward(self, x):
+            mu, lv = self.encode(x)
+            z = self.reparam(mu, lv)
+            return self.decode(z), mu, lv
+    model = M().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=5e-4)
+    mse = nn.MSELoss()
+    loader = DataLoader(TensorDataset(data), batch_size=8, shuffle=True)
+    for _ in range(200):
+        for x, in loader:
+            xh, mu, lv = model(x)
+            lrec = mse(xh, x)
+            kld = -0.5*torch.mean(1+lv-mu.pow(2)-lv.exp())
+            dif = xh[:,1:,:] - xh[:,:-1,:]
+            lm = torch.mean(F.relu(-dif)**2)
+            dif2 = dif[:,1:,:] - dif[:,:-1,:]
+            lc = torch.mean(F.relu(-dif2)**2)
+            loss = lrec + 0.05*kld + args.lambda_mono*lm + args.lambda_curv*lc
+            opt.zero_grad(); loss.backward(); opt.step()
+    model.eval()
+    gens = []
+    with torch.no_grad():
+        for _ in range(args.num_samples):
+            z = torch.randn(args.z_dim, device=device)
+            y = model.decode(z)
+            y, _ = torch.cummax(y, dim=1)
+            gens.append(y)
+    gen = torch.stack(gens)
+    save_generated(gen, case, "VAE")
 
-    # Prepare training data
-    train_arr = np.concatenate([splits[i] for i in train_indices], axis=0)
-    train_norm, _, _ = normalize_2d_array(train_arr)
+def train_timegan(data, case):
+    class E(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l = nn.LSTM(args.feat_dim, args.hid_dim, 3, batch_first=True)
+        def forward(self, x):
+            return self.l(x)[0]
+    class R(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l = nn.LSTM(args.hid_dim, args.hid_dim, 3, batch_first=True)
+            self.o = nn.Linear(args.hid_dim, args.feat_dim)
+        def forward(self, h):
+            return torch.sigmoid(self.o(self.l(h)[0]))
+    class Gm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l = nn.LSTM(args.noise_dim, args.hid_dim, 3, batch_first=True)
+        def forward(self, z):
+            return self.l(z)[0]
+    class S(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l = nn.LSTM(args.hid_dim, args.hid_dim, 3, batch_first=True)
+        def forward(self, h):
+            return self.l(h)[0]
+    class Dm(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l = nn.LSTM(args.hid_dim, args.hid_dim, 3, batch_first=True)
+            self.o = nn.Linear(args.hid_dim, 1)
+        def forward(self, h):
+            return torch.sigmoid(self.o(self.l(h)[0][:,-1]))
+    E1, R1, G1, S1, D1 = E().to(device), R().to(device), Gm().to(device), S().to(device), Dm().to(device)
+    oE = torch.optim.Adam(list(E1.parameters())+list(R1.parameters()), lr=5e-4)
+    oG = torch.optim.Adam(list(G1.parameters())+list(S1.parameters()), lr=5e-4)
+    oD = torch.optim.Adam(D1.parameters(), lr=5e-4)
+    mse = nn.MSELoss()
+    bce = nn.BCELoss()
+    loader = DataLoader(TensorDataset(data), batch_size=16, shuffle=True)
+    for _ in range(150):
+        for x, in loader:
+            l = mse(R1(E1(x)), x)
+            oE.zero_grad(); l.backward(); oE.step()
+    for _ in range(150):
+        for x, in loader:
+            h = E1(x)
+            l = mse(S1(h)[:,1:,:], h[:,:-1,:])
+            oG.zero_grad(); l.backward(); oG.step()
+    for _ in range(200):
+        for x, in loader:
+            bs = x.size(0)
+            for __ in range(20):
+                z = torch.randn(bs, args.seq_len, args.noise_dim, device=device)
+                hf = G1(z); hs = S1(hf); xf = R1(hs)
+                gu = bce(D1(hs), torch.ones(bs,1,device=device))
+                gs = mse(S1(hs)[:,1:,:], hs[:,:-1,:])
+                gr = mse(xf, x)
+                dif = xf[:,1:,:] - xf[:,:-1,:]; lm = torch.mean(F.relu(-dif)**2)
+                dif2 = dif[:,1:,:] - dif[:,:-1,:]; lc = torch.mean(F.relu(-dif2)**2)
+                loss = gu + 100*gs + 100*gr + args.lambda_mono*lm + args.lambda_curv*lc
+                oG.zero_grad(); loss.backward(); oG.step()
+            with torch.no_grad():
+                hr = E1(x)
+                hf = G1(torch.randn(bs, args.seq_len, args.noise_dim, device=device))
+                hs = S1(hf)
+            dr, df = D1(hr), D1(hs)
+            ld = bce(dr, torch.ones_like(dr)) + bce(df, torch.zeros_like(df))
+            oD.zero_grad(); ld.backward(); oD.step()
+    with torch.no_grad():
+        z = torch.randn(args.num_samples, args.seq_len, args.noise_dim, device=device)
+        xf = R1(S1(G1(z))).clamp(0,1)
+        xf, _ = torch.cummax(xf, dim=1)
+    save_generated(xf, case, "TimeGAN")
 
-    # DataLoader for training
-    train_windows = sliding_windows(train_norm, args.window_size, args.step_size)
-    train_loader = DataLoader(torch.tensor(train_windows), batch_size=args.batch_size, shuffle=False)
-
-    # Initialize model
-    model = BayesianNetwork(
-        input_dim=train_windows.shape[2],
-        hidden_dim=args.hidden_size,
-        output_dim=train_windows.shape[2],
-        dropout_rate=args.dropout)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    # Train once
-    train_model(model, train_loader, nn.L1Loss(), optimizer, args.epochs)
-
-    # Generate predictions for each validation split
-    predictions = {}
-    for idx in val_indices:
-        preds = generate_predictions(
-            model,
-            splits[idx],
-            args.window_size,
-            args.step_size,
-            args.n_samples
-        )
-        predictions[f"split{idx+1}"] = preds
-
-    return predictions
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Bayesian predictor with custom case selection for validation sets")
-    parser.add_argument("--csv_file", type=str, required=True)
-    parser.add_argument("--nrows", type=int, default=None)
-    parser.add_argument("--split_size", type=int, default=10)
-    parser.add_argument("--num_splits", type=int, default=4)
-    parser.add_argument("--window_size", type=int, default=2)
-    parser.add_argument("--step_size", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=5)
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--lr", type=float, default=0.005)
-    parser.add_argument("--hidden_size", type=int, default=64)
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--n_samples", type=int, default=100)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--case", type=str, choices=["case1","case2","case3"], required=True,
-                        help="Select which case to use for validation splits")
-
-    args = parser.parse_args()
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
-    predictions = cross_validate(args)
-    print(predictions)
+def train_diffusion(data, case):
+    deltas = data[:,1:,:] - data[:,:-1,:]
+    mean_delta = deltas.mean(dim=0, keepdim=True)
+    model = DiffUNet(args.feat_dim, args.hid_dim, args.seq_len).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.LR)
+    loader = DataLoader(TensorDataset(data), batch_size=args.BATCH_SZ, shuffle=True)
+    mse = nn.MSELoss()
+    t_lin = torch.linspace(0,1,args.seq_len,device=device).view(1,args.seq_len,1)
+    betas = torch.linspace(args.BETA_START, args.BETA_END, args.TIMESTEPS, device=device)
+    alphas = 1 - betas
+    abar = torch.cumprod(alphas, dim=0)
+    for _ in range(args.EPOCHS):
+        for x0_norm, in loader:
+            bs = x0_norm.size(0)
+            t = torch.randint(0, args.TIMESTEPS, (bs,), device=device)
+            a_t = abar[t].view(bs,1,1)
+            noise = torch.randn_like(x0_norm)
+            x_t = torch.sqrt(a_t)*x0_norm + torch.sqrt(1-a_t)*noise
+            pred_noise = model(x_t, t)
+            loss_n = mse(pred_noise, noise)
+            x_pred0 = (x_t - torch.sqrt(1-a_t)*pred_noise)/torch.sqrt(a_t)
+            loss_r = mse(x_pred0, x0_norm)
+            dif = x_pred0[:,1:,:] - x_pred0[:,:-1,:]
+            loss_m = torch.mean(F.relu(-dif)**2)
+            dif2 = dif[:,1:,:] - dif[:,:-1,:]
+            loss_c = torch.mean(F.relu(-dif2)**2)
+            b0 = F.relu(-x_pred0); b1 = F.relu(x_pred0-1)
+            loss_rg = torch.mean(b0**2 + b1**2)
+            start = x0_norm[:,0:1,:]; end = x0_norm[:,-1:,:]
+            baseline = (1 - t_lin)*start + t_lin*end
+            loss_i = mse(x_pred0, baseline)
+            loss = (args.lambda_noise*loss_n + args.lambda_recon*loss_r +
+                    args.lambda_mono*loss_m + args.lambda_curv*loss_c +
+                    args.lambda_range*loss_rg + args.lambda_interp*loss_i)
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            opt.step()
+    gens = []
+    with torch.no_grad():
+        for _ in range(args.num_samples):
+            start = data[0:1,0:1,:]; end = data[0:1,-1:,:]
+            baseline = ((1-t_lin)*start + t_lin*end).squeeze(0)
+            aT = abar[-1]
+            x = torch.sqrt(aT)*baseline + torch.sqrt(1-aT)*torch.randn_like(baseline)
+            for ti in reversed(range(args.TIMESTEPS)):
+                beta = betas[ti]; a = alphas[ti]; ab = abar[ti]
+                eps = model(x.unsqueeze(0), torch.tensor([ti], device=device)).squeeze(0)
+                x = (x - beta/torch.sqrt(1-ab)*eps)/torch.sqrt(a)
+                x = x.clamp(0,1)
+            x, _ = torch.cummax(x, dim=0)
+            x[0,:] = 0; x[-1,:] = 1
+            gens.append(x)
+    gen_norm = torch.stack(gens, 0)
+    save_generated(gen_norm, case, "Diffusion")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_path",         default="combined_matrix.csv", type=str)
+    parser.add_argument("--num_raw_samples",   default=3,                     type=int)
+    parser.add_argument("--seq_len",           default=10,                    type=int)
+    parser.add_argument("--noise_dim",         default=64,                    type=int)
+    parser.add_argument("--hid_dim",           default=128,                   type=int)
+    parser.add_argument("--z_dim",             default=64,                    type=int)
+    parser.add_argument("--TIMESTEPS",         default=1000,                  type=int)
+    parser.add_argument("--BETA_START",        default=1e-4,                  type=float)
+    parser.add_argument("--BETA_END",          default=0.02,                  type=float)
+    parser.add_argument("--LR",                default=1e-5,                  type=float)
+    parser.add_argument("--EPOCHS",            default=200,                   type=int)
+    parser.add_argument("--BATCH_SZ",          default=8,                     type=int)
+    parser.add_argument("--lambda_noise",      default=1.0,                   type=float)
+    parser.add_argument("--lambda_recon",      default=1.0,                   type=float)
+    parser.add_argument("--lambda_mono",       default=0.1,                   type=float)
+    parser.add_argument("--lambda_curv",       default=0.1,                   type=float)
+    parser.add_argument("--lambda_range",      default=1.0,                   type=float)
+    parser.add_argument("--lambda_interp",     default=10.0,                  type=float)
+    parser.add_argument("--grad_clip",         default=1.0,                   type=float)
+    parser.add_argument("--num_samples",       default=30,                    type=int)
+    parser.add_argument("--out_dir",           default="generated",           type=str)
+    parser.add_argument("--device",            default="cuda", choices=["cuda","cpu"])
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if args.device=="cuda" and torch.cuda.is_available() else "cpu")
+    raw = pd.read_csv(args.data_path, header=None).values
+    args.feat_dim = raw.shape[1]
+    samples = []
+    for i in range(args.num_raw_samples):
+        arr = raw[i*args.seq_len:(i+1)*args.seq_len]
+        samples.append(torch.tensor((arr-6.0)/19.0, dtype=torch.float32).to(device))
+    def get_case(idxs):
+        return torch.stack([samples[i] for i in idxs], dim=0)
+    cases = {'case1':[0,1],'case2':[1,2],'case3':[0,2]}
+    for name, idx in cases.items():
+        d = get_case(idx)
+        train_gan(d, name)
+        train_ae(d, name)
+        train_vae(d, name)
+        train_timegan(d, name)
+        train_diffusion(d, name)
