@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # run_case1.sh
-# Full shell script to train and predict on gan_case1.csv using case1 (splits 3 & 4) with pre.py
+# Full shell script to train and predict on gan_case1.csv using case1 (splits 3 & 4)
+# with nested train/validation splitting
 
 # --- Configuration ---
 # Path to the CSV (no header)
@@ -21,6 +22,7 @@ HIDDEN_SIZE=${HIDDEN_SIZE:-64}
 DROPOUT=${DROPOUT:-0.1}
 N_SAMPLES=${N_SAMPLES:-100}
 SEED=${SEED:-42}
+TRAIN_VAL_RATIO=${TRAIN_VAL_RATIO:-0.8}
 
 # --- Check dependencies ---
 if [[ ! -f prediction.py ]]; then
@@ -43,6 +45,7 @@ python3 prediction.py \
     --dropout "$DROPOUT" \
     --n_samples "$N_SAMPLES" \
     --seed "$SEED" \
-    --case "$CASE"
+    --case "$CASE" \
+    --train_val_ratio "$TRAIN_VAL_RATIO"
 
 echo "Prediction for $CASE complete on $CSV_FILE."
