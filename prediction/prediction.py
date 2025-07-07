@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Command-line tool for Bayesian time-series step prediction with custom cross-validation cases,
-now with publication-quality training & validation loss plotting and CSV export,
-and with an internal train/validation split fixed to match dataset lengths.
-"""
 import argparse
 import numpy as np
 import pandas as pd
@@ -13,18 +8,17 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
 import matplotlib.pyplot as plt
 
-
 class TimeSeriesDataset(Dataset):
-    """Dataset wrapping sliding-window sequences for next-step prediction."""
+    
     def __init__(self, sequences: torch.Tensor):
         self.sequences = sequences
 
     def __len__(self):
-        # We have N rows but only N-1 valid (x, y) pairs
+        
         return len(self.sequences) - 1
 
     def __getitem__(self, idx):
-        # Return full vector at t and t+1
+        
         return self.sequences[idx], self.sequences[idx + 1]
 
 
@@ -132,15 +126,15 @@ def cross_validate(args):
     val_indices   = case_map[args.case]
     train_indices = [i for i in range(args.num_splits) if i not in val_indices]
 
-    # --- external train/val split (unchanged) ---
+    
     train_arr = np.concatenate([splits[i] for i in train_indices], axis=0)
     val_arr   = np.concatenate([splits[i] for i in val_indices], axis=0)
 
-    # --- internal train/val split on train_arr ---
+    
     train_norm, _, _ = normalize_2d_array(train_arr)
     full_ds = TimeSeriesDataset(torch.tensor(train_norm))
 
-    # total number of (x,y) pairs:
+    
     total_pairs = len(full_ds)  
     train_pairs = int(total_pairs * args.train_val_ratio)
     val_pairs   = total_pairs - train_pairs
@@ -153,12 +147,12 @@ def cross_validate(args):
     train_loader     = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     inner_val_loader = DataLoader(inner_val_ds, batch_size=args.batch_size, shuffle=False)
 
-    # --- external validation loader (unchanged) ---
+    
     val_norm = normalize_2d_array(val_arr)[0]
     val_loader = DataLoader(TimeSeriesDataset(torch.tensor(val_norm)),
                             batch_size=args.batch_size, shuffle=False)
 
-    # --- model setup ---
+    
     input_dim  = train_norm.shape[1]
     output_dim = input_dim - 1
     model = BayesianNetwork(input_dim=input_dim,
@@ -168,7 +162,7 @@ def cross_validate(args):
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     criterion = nn.L1Loss()
 
-    # --- training loop with both internal & external validation ---
+    
     for epoch in range(1, args.epochs + 1):
         tr_loss = train_one_epoch(model, train_loader, criterion, optimizer)
         iv_loss = validate(model, inner_val_loader, criterion)
@@ -178,7 +172,7 @@ def cross_validate(args):
               f"inner-val_loss: {iv_loss:.4f}, "
               f"outer-val_loss: {ov_loss:.4f}")
 
-    # --- generate predictions on external splits ---
+    
     results = {}
     for idx in val_indices:
         results[f"split{idx+1}"] = generate_predictions(
