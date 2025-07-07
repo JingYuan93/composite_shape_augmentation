@@ -169,8 +169,7 @@ def cross_validate(args):
         ov_loss = validate(model, val_loader, criterion)
         print(f"Epoch {epoch}/{args.epochs} — "
               f"train_loss: {tr_loss:.4f}, "
-              f"inner-val_loss: {iv_loss:.4f}, "
-              f"outer-val_loss: {ov_loss:.4f}")
+              f"inner-val_loss: {iv_loss:.4f}, ")
 
     
     results = {}
