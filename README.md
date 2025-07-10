@@ -19,5 +19,5 @@
 # Citation
 If you find this repo or our work useful for your research, please consider citing this paper and the papers below
 
-a. Particle filter-based delamination shape prediction in composites subjected to fatigue loading;
-b. Multiple local particle filter for high-dimensional system identification
+* Particle filter-based delamination shape prediction in composites subjected to fatigue loading.
+* Multiple local particle filter for high-dimensional system identification
